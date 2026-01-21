@@ -1,11 +1,18 @@
+mod io;
+
+use bytes::BytesMut;
+use io::buffer_pool::BufferPool;
+
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 use slab::Slab;
+use std::io::Read;
 use std::io::Write;
-use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+use crate::io::buffer_pool::BUFFER_STANDARD_SIZE;
 
 const LISTENER_TOKEN: Token = Token(0);
 const WAKER_TOKEN: Token = Token(1);
@@ -18,43 +25,56 @@ enum ConnectionState {
 }
 
 struct Connection {
-    read_buffer: Vec<u8>,
-    write_buffer: Vec<u8>,
+    read_buffer: BytesMut,
+    write_buffer: BytesMut,
     state: ConnectionState,
     socket: TcpStream,
 }
 
 impl Connection {
-    fn new(socket: TcpStream) -> Self {
+    fn new(socket: TcpStream, read_buffer: BytesMut, write_buffer: BytesMut) -> Self {
         Connection {
-            read_buffer: Vec::new(),
-            write_buffer: Vec::new(),
             state: ConnectionState::Reading,
+            read_buffer,
+            write_buffer,
             socket,
         }
     }
 
     fn read(&mut self) {
-        let mut buf = [0u8; 1024];
-
-        match self.socket.read(&mut buf) {
-            Ok(0) => {
-                self.state = ConnectionState::Closed;
-            }
-            Ok(n) => {
-                self.read_buffer.extend_from_slice(&buf[..n]);
-                println!("Read {} bytes", n);
-
-                self.state = ConnectionState::Writing;
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Do nothing, no data yet
-            }
-            Err(e) => {
-                eprintln!("Read error: {}", e);
-                self.state = ConnectionState::Closed;
-            }
+        if self.read_buffer.capacity() == self.read_buffer.len() {
+            self.read_buffer.reserve(1024);
         }
+
+        let n = unsafe {
+            let (ptr, len) = (
+                self.read_buffer.as_mut_ptr().add(self.read_buffer.len()),
+                self.read_buffer.capacity() - self.read_buffer.len(),
+            );
+            let slice = std::slice::from_raw_parts_mut(ptr, len);
+
+            match self.socket.read(slice) {
+                Ok(0) => {
+                    self.state = ConnectionState::Closed;
+                    return;
+                }
+                Ok(n) => n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(_) => {
+                    self.state = ConnectionState::Closed;
+                    return;
+                }
+            }
+        };
+
+        // Increment the length of BytesMut to reflect new data
+        unsafe {
+            let new_len = self.read_buffer.len() + n;
+            self.read_buffer.set_len(new_len);
+        }
+
+        // Trigger state change
+        self.state = ConnectionState::Writing;
     }
 
     fn write(&mut self) {
@@ -74,7 +94,7 @@ impl Connection {
                 self.state = ConnectionState::Closed;
             }
             Ok(n) => {
-                self.write_buffer.drain(..n);
+                let _ = self.write_buffer.split_to(n);
 
                 if self.write_buffer.is_empty() {
                     self.state = ConnectionState::Closed;
@@ -88,7 +108,7 @@ impl Connection {
     }
 }
 
-pub fn run(addr: SocketAddr) -> io::Result<()> {
+pub fn run(addr: SocketAddr) -> std::io::Result<()> {
     let mut listener = TcpListener::bind(addr)?;
     println!("Listening on {}", addr);
 
@@ -114,6 +134,8 @@ pub fn run(addr: SocketAddr) -> io::Result<()> {
 
     let mut connections: Slab<Connection> = Slab::with_capacity(1024);
 
+    let mut buffer_pool = BufferPool::new(1024, BUFFER_STANDARD_SIZE);
+
     loop {
         let mut to_remove: Vec<Token> = Vec::new();
         poll.poll(&mut events, None)?;
@@ -132,7 +154,11 @@ pub fn run(addr: SocketAddr) -> io::Result<()> {
                                 token,
                                 Interest::READABLE.add(Interest::WRITABLE),
                             )?;
-                            entry.insert(Connection::new(stream));
+                            entry.insert(Connection::new(
+                                stream,
+                                buffer_pool.checkout(),
+                                buffer_pool.checkout(),
+                            ));
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(e) => eprintln!("Accept error: {}", e),
@@ -163,8 +189,16 @@ pub fn run(addr: SocketAddr) -> io::Result<()> {
         }
 
         for token in to_remove {
+            // TODO use try_remove
             let mut conn = connections.remove(usize::from(token) - SLAB_OFFSET);
             poll.registry().deregister(&mut conn.socket)?;
+
+            // Return buffer to the buffer pool
+            let read_buf = conn.read_buffer;
+            let write_buf = conn.write_buffer;
+            buffer_pool.return_buffer(read_buf);
+            buffer_pool.return_buffer(write_buf);
+
             println!("Connection closed and removed.");
         }
     }
