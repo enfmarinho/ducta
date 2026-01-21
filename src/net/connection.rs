@@ -179,8 +179,7 @@ impl Connection {
         }
 
         // If the loop finishes, the buffer is empty.
-        // TODO: when HTTP Keep-Alive is implemented, switch back to Reading instead.
-        self.state = ConnectionState::Closed;
+        self.state = ConnectionState::Reading;
 
         Ok(bytes_written_this_turn)
     }
