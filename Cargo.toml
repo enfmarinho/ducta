@@ -1,6 +1,6 @@
 [package]
 name = "ducta"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Experimental non-blocking HTTP server focused on explicit I/O state machines"
 license = "MIT OR Apache-2.0"
