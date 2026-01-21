@@ -1,11 +1,10 @@
 mod io;
 mod net;
 
-use io::buffer_pool::BufferPool;
-use net::connection::{Connection, ConnectionState};
-
+use io::{BufferPool, BUFFER_STANDARD_SIZE};
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token, Waker};
+use net::{Connection, ConnectionState};
 use slab::Slab;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
