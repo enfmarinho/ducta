@@ -1,5 +1,5 @@
 use crate::handler::Handler;
-use crate::io::{BufferPool};
+use crate::io::{BUFFER_STANDARD_SIZE, BufferPool};
 use crate::net::{Connection, ConnectionState};
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token, Waker};
@@ -35,7 +35,7 @@ impl<H: Handler> Server<H> {
             events,
             listener,
             connections: Slab::with_capacity(1024),
-            buffer_pool: BufferPool::new(1024, 8192), // 1024 buffers of 8KB
+            buffer_pool: BufferPool::new(1024, BUFFER_STANDARD_SIZE),
             handler,
         })
     }
