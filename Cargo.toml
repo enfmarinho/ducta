@@ -13,3 +13,4 @@ mio = { version = "1.1.1", features = ["net", "os-poll"] }
 slab = "0.4.11"
 ctrlc = "3.4"
 bytes = "1.11.0"
+httparse = "1.10.1"
