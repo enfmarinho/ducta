@@ -28,6 +28,9 @@ pub struct Connection {
 
 impl Connection {
     pub fn new(socket: TcpStream, read_buffer: BytesMut, write_buffer: BytesMut) -> Self {
+        // Set TCP_NODELAY to reduce latency
+        let _ = socket.set_nodelay(true);
+
         Connection {
             state: ConnectionState::Reading,
             read_buffer,
