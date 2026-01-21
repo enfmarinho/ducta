@@ -1,3 +1,4 @@
+mod handler;
 mod http;
 mod io;
 mod net;
