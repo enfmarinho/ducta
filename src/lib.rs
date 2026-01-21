@@ -1,3 +1,4 @@
+mod http;
 mod io;
 mod net;
 
@@ -9,8 +10,6 @@ use slab::Slab;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-
-use crate::io::buffer_pool::BUFFER_STANDARD_SIZE;
 
 const LISTENER_TOKEN: Token = Token(0);
 const WAKER_TOKEN: Token = Token(1);
@@ -81,14 +80,8 @@ pub fn run(addr: SocketAddr) -> std::io::Result<()> {
                 }
                 token => {
                     if let Some(conn) = connections.get_mut(usize::from(token) - SLAB_OFFSET) {
-                        if event.is_readable() {
-                            conn.read();
-                        }
-                        if event.is_writable() {
-                            conn.write();
-                        }
-
-                        if let ConnectionState::Closed = conn.state() {
+                        conn.process(event);
+                        if ConnectionState::Closed == *conn.state() {
                             to_remove.push(token);
                         }
                     }
