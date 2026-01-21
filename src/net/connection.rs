@@ -2,7 +2,7 @@ use bytes::BufMut;
 use bytes::BytesMut;
 use mio::event::Event;
 
-use crate::http::Response;
+use crate::handler::Handler;
 use crate::http::{self, ParseStatus};
 
 use mio::net::TcpStream;
@@ -38,7 +38,7 @@ impl Connection {
 
     /// The state machine coordinator.
     /// Dispatches I/O tasks based on current state and event.
-    pub fn process(&mut self, event: &Event) {
+    pub fn process<H: Handler>(&mut self, event: &Event, handler: &H) {
         // Handle the read phase
         // We only read if the socket is ready AND we are expecting a request.
         if event.is_readable() && self.state == ConnectionState::Reading {
@@ -50,7 +50,7 @@ impl Connection {
                 }
                 Ok(n) if n > 0 => {
                     // Data arrived, Try to parse it into an HTTP Request.
-                    self.handle_request();
+                    self.handle_request(handler);
                 }
                 Ok(_) => (), // WouldBlock received, so no more data to read for now
                 Err(_) => {
@@ -194,17 +194,17 @@ impl Connection {
     /// If the `read_buffer` contains more than one request (Pipelining), this method 
     /// only consumes the first request. The remaining bytes stay in the buffer to 
     /// be processed in the next cycle.
-    pub fn handle_request(&mut self) {
+    pub fn handle_request<H: Handler>(&mut self, handler:&H) {
         // Storage for headers (httparse needs a place to put references)
         let mut header_storage = [httparse::EMPTY_HEADER; 64];
 
         // Attempt to parse the read_buffer
         match http::parse_request(&self.read_buffer, &mut header_storage) {
-            ParseStatus::Complete(_req, amt) => {
+            ParseStatus::Complete(req, amt) => {
                 // full HTTP Request
 
                 // For now, ignore the request and just generate a hardcoded response
-                let resp = Response::new(200).with_body("Hello from Ducta!");
+                let resp = handler.handle(req);
 
                 // Encode the response into the write_buffer
                 resp.encode(&mut self.write_buffer);
