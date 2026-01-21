@@ -1,6 +1,12 @@
-use std::io::Read;
+use mio::net::{TcpListener, TcpStream};
+use mio::{Events, Interest, Poll, Token};
+use slab::Slab;
 use std::io::Write;
-use std::net::{TcpListener, TcpStream};
+use std::io::{self, Read};
+use std::net::SocketAddr;
+
+const LISTENER_TOKEN: Token = Token(0);
+const SLAB_OFFSET: usize = 1;
 
 enum ConnectionState {
     Reading,
@@ -78,46 +84,60 @@ impl Connection {
         }
     }
 }
-pub fn run() {
-    let listener = TcpListener::bind("127.0.0.1:8080").expect("failed to bind to address");
 
-    listener
-        .set_nonblocking(true)
-        .expect("failed to set non-blocking");
+pub fn run(addr: SocketAddr) -> io::Result<()> {
+    let mut listener = TcpListener::bind(addr)?;
+    println!("Listening on {}", addr);
 
-    println!("Listening on 127.0.0.1:8080");
+    let mut poll = Poll::new()?;
+    poll.registry()
+        .register(&mut listener, Token(0), Interest::READABLE)?;
 
-    let mut connections: Vec<Connection> = Vec::new();
+    let mut events = Events::with_capacity(1024);
+
+    let mut connections: Slab<Connection> = Slab::with_capacity(1024);
 
     loop {
-        // Accept new connections
-        match listener.accept() {
-            Ok((stream, addr)) => {
-                println!("New connection from {}", addr);
-                stream
-                    .set_nonblocking(true)
-                    .expect("failed to set non-blocking");
+        let mut to_remove: Vec<Token> = Vec::new();
+        poll.poll(&mut events, None)?;
+        for event in events.iter() {
+            println!("{:?}", event);
 
-                connections.push(Connection::new(stream));
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No new connections
-            }
-            Err(e) => {
-                eprintln!("Accept error: {}", e);
+            if event.token() == LISTENER_TOKEN {
+                // Accept new connection
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        let entry = connections.vacant_entry();
+                        let token = Token(entry.key() + SLAB_OFFSET);
+                        poll.registry().register(
+                            &mut stream,
+                            token,
+                            Interest::READABLE.add(Interest::WRITABLE),
+                        )?;
+                        entry.insert(Connection::new(stream));
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => eprintln!("Accept error: {}", e),
+                }
+            } else if let Some(conn) = connections.get_mut(usize::from(event.token()) - SLAB_OFFSET)
+            {
+                if event.is_readable() {
+                    conn.read();
+                }
+                if event.is_writable() {
+                    conn.write();
+                }
+
+                if let ConnectionState::Closed = conn.state {
+                    to_remove.push(event.token());
+                }
             }
         }
 
-        // Handle existing connections
-        for conn in connections.iter_mut() {
-            match conn.state {
-                ConnectionState::Reading => conn.read(),
-                ConnectionState::Writing => conn.write(),
-                ConnectionState::Closed => {}
-            }
+        for token in to_remove {
+            let mut conn = connections.remove(usize::from(token) - SLAB_OFFSET);
+            poll.registry().deregister(&mut conn.socket)?;
+            println!("Connection closed and removed.");
         }
-
-        // Remove closed connections
-        connections.retain(|c| !matches!(c.state, ConnectionState::Closed));
     }
 }
