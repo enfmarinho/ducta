@@ -9,3 +9,5 @@ repository = "https://github.com/enfmarinho/ducta"
 readme = "README.md"
 
 [dependencies]
+mio = { version = "1.1.1", features = ["net", "os-poll"] }
+slab = "0.4.11"
