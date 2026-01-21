@@ -1,12 +1,15 @@
 use mio::net::{TcpListener, TcpStream};
-use mio::{Events, Interest, Poll, Token};
+use mio::{Events, Interest, Poll, Token, Waker};
 use slab::Slab;
 use std::io::Write;
 use std::io::{self, Read};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 const LISTENER_TOKEN: Token = Token(0);
-const SLAB_OFFSET: usize = 1;
+const WAKER_TOKEN: Token = Token(1);
+const SLAB_OFFSET: usize = 2;
 
 enum ConnectionState {
     Reading,
@@ -93,6 +96,20 @@ pub fn run(addr: SocketAddr) -> io::Result<()> {
     poll.registry()
         .register(&mut listener, Token(0), Interest::READABLE)?;
 
+    // Stop flag and Waker to gracefully kill application
+    let should_stop = Arc::new(AtomicBool::new(false));
+    let r = should_stop.clone();
+    let waker = Arc::new(Waker::new(poll.registry(), WAKER_TOKEN)?);
+    let waker_for_signal = waker.clone();
+
+    // set signal handler to Ctrl-C
+    ctrlc::set_handler(move || {
+        println!("\nShutdown signal received...");
+        r.store(true, Ordering::SeqCst);
+        waker_for_signal.wake().expect("Failed to wake event loop");
+    })
+    .expect("Error setting Ctrl-C handler");
+
     let mut events = Events::with_capacity(1024);
 
     let mut connections: Slab<Connection> = Slab::with_capacity(1024);
@@ -103,33 +120,44 @@ pub fn run(addr: SocketAddr) -> io::Result<()> {
         for event in events.iter() {
             println!("{:?}", event);
 
-            if event.token() == LISTENER_TOKEN {
-                // Accept new connection
-                match listener.accept() {
-                    Ok((mut stream, _addr)) => {
-                        let entry = connections.vacant_entry();
-                        let token = Token(entry.key() + SLAB_OFFSET);
-                        poll.registry().register(
-                            &mut stream,
-                            token,
-                            Interest::READABLE.add(Interest::WRITABLE),
-                        )?;
-                        entry.insert(Connection::new(stream));
+            match event.token() {
+                LISTENER_TOKEN => {
+                    // Accept new connection
+                    match listener.accept() {
+                        Ok((mut stream, _addr)) => {
+                            let entry = connections.vacant_entry();
+                            let token = Token(entry.key() + SLAB_OFFSET);
+                            poll.registry().register(
+                                &mut stream,
+                                token,
+                                Interest::READABLE.add(Interest::WRITABLE),
+                            )?;
+                            entry.insert(Connection::new(stream));
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) => eprintln!("Accept error: {}", e),
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => eprintln!("Accept error: {}", e),
                 }
-            } else if let Some(conn) = connections.get_mut(usize::from(event.token()) - SLAB_OFFSET)
-            {
-                if event.is_readable() {
-                    conn.read();
+                WAKER_TOKEN => {
+                    println!("Waker triggered! Checking exit flag.");
+                    if should_stop.load(Ordering::SeqCst) {
+                        println!("Graceful shutdown starting...");
+                        return Ok(()); // Exit the run function
+                    }
                 }
-                if event.is_writable() {
-                    conn.write();
-                }
+                token => {
+                    if let Some(conn) = connections.get_mut(usize::from(token) - SLAB_OFFSET) {
+                        if event.is_readable() {
+                            conn.read();
+                        }
+                        if event.is_writable() {
+                            conn.write();
+                        }
 
-                if let ConnectionState::Closed = conn.state {
-                    to_remove.push(event.token());
+                        if let ConnectionState::Closed = conn.state {
+                            to_remove.push(token);
+                        }
+                    }
                 }
             }
         }
