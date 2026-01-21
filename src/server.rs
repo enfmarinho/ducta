@@ -1,5 +1,5 @@
 use crate::handler::Handler;
-use crate::io::{BUFFER_STANDARD_SIZE, BufferPool};
+use crate::io::{BufferPool, BUFFER_STANDARD_SIZE};
 use crate::net::{Connection, ConnectionState};
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token, Waker};
@@ -28,7 +28,7 @@ impl<H: Handler> Server<H> {
 
         // Register the listener to know when new clients connect
         poll.registry()
-            .register(&mut listener, Token(0), Interest::READABLE)?;
+            .register(&mut listener, LISTENER_TOKEN, Interest::READABLE)?;
 
         Ok(Self {
             poll,
@@ -49,51 +49,73 @@ impl<H: Handler> Server<H> {
 
         // set signal handler to Ctrl-C
         ctrlc::set_handler(move || {
-            println!("\nShutdown signal received...");
+            eprintln!("\nShutdown signal received...");
             r.store(true, Ordering::SeqCst);
             waker_for_signal.wake().expect("Failed to wake event loop");
         })
         .expect("Error setting Ctrl-C handler");
 
-        loop {
-            let mut to_remove: Vec<Token> = Vec::new();
-            self.poll.poll(&mut self.events, None)?;
-            for event in self.events.iter() {
-                println!("{:?}", event);
+        let mut to_remove: Vec<Token> = Vec::new();
 
+        loop {
+            to_remove.clear();
+
+            self.poll.poll(&mut self.events, None)?;
+
+            for event in self.events.iter() {
                 match event.token() {
                     LISTENER_TOKEN => {
-                        // Accept new connection
-                        match self.listener.accept() {
-                            Ok((mut stream, _addr)) => {
-                                let entry = self.connections.vacant_entry();
-                                let token = Token(entry.key() + SLAB_OFFSET);
-                                self.poll.registry().register(
-                                    &mut stream,
-                                    token,
-                                    Interest::READABLE.add(Interest::WRITABLE),
-                                )?;
-                                entry.insert(Connection::new(
-                                    stream,
-                                    self.buffer_pool.checkout(),
-                                    self.buffer_pool.checkout(),
-                                ));
+                        // Accept as many connections as possible
+                        loop {
+                            match self.listener.accept() {
+                                Ok((mut stream, _addr)) => {
+                                    let entry = self.connections.vacant_entry();
+                                    let token = Token(entry.key() + SLAB_OFFSET);
+
+                                    if let Err(e) = self.poll.registry().register(
+                                        &mut stream,
+                                        token,
+                                        Interest::READABLE,
+                                    ) {
+                                        eprintln!("Failed to register connection: {}", e);
+                                        continue;
+                                    }
+
+                                    entry.insert(Connection::new(
+                                        stream,
+                                        self.buffer_pool.checkout(),
+                                        self.buffer_pool.checkout(),
+                                    ));
+                                }
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    // No more connections to accept right now
+                                    break;
+                                }
+                                Err(e) => {
+                                    eprintln!("Accept error: {}", e);
+                                    break;
+                                }
                             }
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                            Err(e) => eprintln!("Accept error: {}", e),
                         }
                     }
                     WAKER_TOKEN => {
-                        println!("Waker triggered! Checking exit flag.");
                         if should_stop.load(Ordering::SeqCst) {
-                            println!("Graceful shutdown starting...");
-                            return Ok(()); // Exit the run function
+                            eprintln!("Graceful shutdown starting...");
+                            return Ok(());
                         }
                     }
                     token => {
-                        if let Some(conn) = self.connections.get_mut(usize::from(token) - SLAB_OFFSET) {
-                            conn.process(event, &self.handler);
-                            if ConnectionState::Closed == *conn.state() {
+                        let conn_idx = usize::from(token) - SLAB_OFFSET;
+                        if let Some(conn) = self.connections.get_mut(conn_idx) {
+                            if let Some(new_interest) = conn.process(event, &self.handler) {
+                                self.poll.registry().reregister(
+                                    conn.socket(),
+                                    token,
+                                    new_interest,
+                                )?;
+                            }
+
+                            if *conn.state() == ConnectionState::Closed {
                                 to_remove.push(token);
                             }
                         }
@@ -101,17 +123,22 @@ impl<H: Handler> Server<H> {
                 }
             }
 
-            for token in to_remove {
-                // TODO use try_remove
-                let mut conn = self.connections.remove(usize::from(token) - SLAB_OFFSET);
-                self.poll.registry().deregister(conn.socket())?;
+            // Clean up closed connections
+            for token in &to_remove {
+                let conn_idx = usize::from(*token) - SLAB_OFFSET;
+                let mut conn = self.connections.remove(conn_idx);
+
+                if let Err(e) = self.poll.registry().deregister(conn.socket()) {
+                    eprintln!("Failed to deregister connection: {}", e);
+                }
 
                 // Return buffer to the buffer pool
                 let (buf1, buf2) = conn.get_buffers();
                 self.buffer_pool.return_buffer(buf1);
                 self.buffer_pool.return_buffer(buf2);
 
-                println!("Connection closed and removed.");
+                // TODO this can be removed, just for visualization
+                println!("Removing connection at index: {}", conn_idx);
             }
         }
     }

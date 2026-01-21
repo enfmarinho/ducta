@@ -1,6 +1,7 @@
 use bytes::BufMut;
 use bytes::BytesMut;
 use mio::event::Event;
+use mio::Interest;
 
 use crate::handler::Handler;
 use crate::http::{self, ParseStatus};
@@ -41,40 +42,55 @@ impl Connection {
 
     /// The state machine coordinator.
     /// Dispatches I/O tasks based on current state and event.
-    pub fn process<H: Handler>(&mut self, event: &Event, handler: &H) {
-        // Handle the read phase
-        // We only read if the socket is ready AND we are expecting a request.
+    pub fn process<H: Handler>(&mut self, event: &Event, handler: &H) -> Option<Interest> {
+        let mut changed_interest = false;
+        // Handle reads
         if event.is_readable() && self.state == ConnectionState::Reading {
             match self.read() {
+                // Clean close: peer shut down the connection
                 Ok(0) => {
-                    // Clean close: peer shut down the connection
                     self.state = ConnectionState::Closed;
-                    return;
+                    return None;
                 }
-                Ok(n) if n > 0 => {
-                    // Data arrived, Try to parse it into an HTTP Request.
+
+                // Data arrived, Try to parse it into an HTTP Request.
+                Ok(_n) => {
                     self.handle_request(handler);
+                    changed_interest = true; // State changed to Writing
                 }
-                Ok(_) => (), // WouldBlock received, so no more data to read for now
+
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
+
                 Err(_) => {
                     // Fatal socket error
                     self.state = ConnectionState::Closed;
-                    return;
+                    return None;
                 }
             }
         }
 
-        // Handles the write phase
-        if self.state == ConnectionState::Writing {
+        // Handle writes
+        if event.is_writable() && self.state == ConnectionState::Writing {
             match self.write() {
                 Ok(_) => {
-                    // write() will set state to Closed once the buffer is fully drained.
                     // If it was a partial write, state remains Writing.
+                    if self.state == ConnectionState::Reading {
+                        changed_interest = true;
+                    }
                 }
-                Err(_) => {
-                    self.state = ConnectionState::Closed;
-                }
+
+                Err(_) => self.state = ConnectionState::Closed,
             }
+        }
+
+        if changed_interest {
+            match self.state {
+                ConnectionState::Reading => Some(Interest::READABLE),
+                ConnectionState::Writing => Some(Interest::WRITABLE),
+                _ => None,
+            }
+        } else {
+            None
         }
     }
 
@@ -97,7 +113,6 @@ impl Connection {
             // Ensure there is space to read.
             if self.read_buffer.remaining_mut() < 1024 {
                 let space_left = MAX_REQUEST_SIZE - self.read_buffer.len();
-                // If we can't even fit 1 more byte, stop reading.
                 if space_left == 0 {
                     break;
                 }
